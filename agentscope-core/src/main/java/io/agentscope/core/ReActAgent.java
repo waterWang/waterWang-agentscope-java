@@ -136,8 +136,10 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -286,11 +288,24 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
     private static final int MAX_CACHED_SLOTS = 1000;
 
     /**
-     * Insertion-order tracker for the slot caches. After each {@code put} or
-     * {@code computeIfAbsent} that adds a new key, the oldest entries are trimmed when
-     * the cache exceeds {@link #MAX_CACHED_SLOTS}.
+     * Monotonic access-sequence generator backing the slot recency order below. Each slot access
+     * is assigned a fresh sequence number so that recency comparisons never require scanning the
+     * cache.
      */
-    private final ConcurrentLinkedDeque<String> slotOrder = new ConcurrentLinkedDeque<>();
+    private final AtomicLong slotAccessSequence = new AtomicLong();
+
+    /** Most recent access-sequence number recorded per slot key. */
+    private final ConcurrentHashMap<String, Long> slotLastAccess = new ConcurrentHashMap<>();
+
+    /**
+     * Recency order of the slot caches, keyed by access-sequence number (oldest first). Unlike a
+     * deque scanned by key, both "promote to most-recently-used" and "evict the least-recently-used"
+     * are O(log n) here instead of a linear scan of up to {@link #MAX_CACHED_SLOTS} entries.
+     */
+    private final ConcurrentSkipListMap<Long, String> slotOrder = new ConcurrentSkipListMap<>();
+
+    /** O(1) count of distinct slots currently tracked by {@link #slotOrder}. */
+    private final AtomicInteger trackedSlotCount = new AtomicInteger();
 
     private final ModelConfig modelConfig;
     private final ReactConfig reactConfig;
@@ -521,25 +536,39 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
     }
 
     /**
-     * Records a slot access in the insertion-order tracker. If the key was already present it is
-     * promoted to the tail (most-recently-used position). Safe to call from multiple threads.
+     * Records a slot access in the recency tracker. If the key was already present it is
+     * promoted to the most-recently-used position; otherwise the tracked slot count grows by one.
+     * Safe to call from multiple threads: promotion and eviction never scan the tracked slots.
      */
     private void recordSlotAccess(String slot) {
-        // Remove-then-add promotes an existing slot to the tail (most recent).
-        slotOrder.remove(slot);
-        slotOrder.addLast(slot);
+        long seq = slotAccessSequence.incrementAndGet();
+        Long previousSeq = slotLastAccess.put(slot, seq);
+        slotOrder.put(seq, slot);
+        if (previousSeq == null) {
+            trackedSlotCount.incrementAndGet();
+        } else {
+            slotOrder.remove(previousSeq);
+        }
     }
 
     /**
-     * Evicts the oldest entries from both caches when the slot count exceeds
+     * Evicts the least-recently-used entries from both caches when the tracked slot count exceeds
      * {@link #MAX_CACHED_SLOTS}. Call after each cache write that may have added a new entry.
      */
     private void trimCaches() {
-        while (slotOrder.size() > MAX_CACHED_SLOTS) {
-            String oldest = slotOrder.pollFirst();
+        while (trackedSlotCount.get() > MAX_CACHED_SLOTS) {
+            Map.Entry<Long, String> oldest = slotOrder.pollFirstEntry();
             if (oldest == null) break;
-            stateCache.remove(oldest);
-            permissionEngineCache.remove(oldest);
+            String slot = oldest.getValue();
+            // A concurrent recordSlotAccess may have already promoted this slot to a newer
+            // sequence number, leaving this polled entry stale. Only remove the cached state /
+            // permission engine (and shrink the tracked count) when this was still the slot's
+            // authoritative position; otherwise the slot remains tracked under its newer entry.
+            if (slotLastAccess.remove(slot, oldest.getKey())) {
+                stateCache.remove(slot);
+                permissionEngineCache.remove(slot);
+                trackedSlotCount.decrementAndGet();
+            }
         }
     }
 
